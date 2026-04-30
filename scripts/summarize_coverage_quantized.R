@@ -1,9 +1,10 @@
 #!/usr/bin/env Rscript
 # summarize_coverage_quantized.R
 #
-# For each strain in samples.csv:
-#   1. Load results/mosdepth/<strain>.quantized.bed.gz (BED4: chrom, start, end, label)
+# For each quantized BED file in results/mosdepth/ (auto-discovered):
+#   1. Load <strain>.quantized.bed.gz (BED4: chrom, start, end, label)
 #      Labels: NO_COVERAGE, LOW_COVERAGE, CALLABLE, HIGH_COVERAGE, VERY_HIGH_COVERAGE
+#      Covers plain Illumina, _ont, and _pb variants automatically.
 #   2. Produce per-strain multi-page PDFs (50 scaffolds per page):
 #        heatmap - geom_rect tiles coloured by coverage class, all scaffolds stacked
 #        bar     - stacked bar showing proportion of each class per scaffold
@@ -15,18 +16,27 @@ library(dplyr)
 library(readr)
 library(stringr)
 library(forcats)
+library(Biostrings)
+library(patchwork)
+library(parallel)
 
 # ---- paths ----
-samples_file  <- "samples.csv"
 mosdepth_dir  <- file.path("results", "mosdepth")
+genome_dir    <- file.path("genome")
 out_base      <- file.path("results", "mosdepth_quantized")
 dir.create(out_base, showWarnings = FALSE, recursive = TRUE)
 
 SCAFFOLDS_PER_PAGE <- 50
-MIN_SCAFFOLD_LENGTH = 50000
-# ---- load strain IDs ----
-samples <- read_csv(samples_file, col_types = cols(.default = col_character()))
-strains <- samples[[1]]   # first column = Sample_ID
+MIN_SCAFFOLD_LENGTH <- 50000
+GC_WINDOW <- 10000   # bp window for GC% smoothing
+
+# ---- discover all quantized BED files (plain, _ont, _pb variants) ----
+bed_files <- list.files(mosdepth_dir, pattern = "\\.quantized\\.bed\\.gz$",
+                        full.names = FALSE)
+if (length(bed_files) == 0) stop("No quantized BED files found in ", mosdepth_dir)
+strains <- sub("\\.quantized\\.bed\\.gz$", "", bed_files)
+message("Found ", length(strains), " quantized BED files: ",
+        paste(strains, collapse = ", "))
 
 # ---- quantized coverage levels: cool -> hot ----
 cov_levels <- c("NO_COVERAGE", "LOW_COVERAGE", "CALLABLE",
@@ -54,10 +64,36 @@ base_theme <- theme_bw(base_size = 10) +
 # ---- helper: split a vector into chunks of n ----
 chunk <- function(x, n) split(x, ceiling(seq_along(x) / n))
 
+# ---- helper: compute GC% in non-overlapping windows (vectorized via Views) ----
+compute_gc_windows <- function(genome, scaffolds, window_size = GC_WINDOW) {
+  scaffolds_present <- intersect(scaffolds, names(genome))
+  if (length(scaffolds_present) == 0) return(NULL)
+  result <- lapply(scaffolds_present, function(chr) {
+    sq     <- genome[[chr]]
+    len    <- length(sq)
+    starts <- seq(1, len, by = window_size)
+    ends   <- pmin(starts + window_size - 1, len)
+    views  <- Views(sq, start = starts, end = ends)
+    gc_pct <- letterFrequency(views, letters = "GC", as.prob = TRUE)[, 1] * 100
+    data.frame(chrom = chr,
+               pos   = (starts + ends) / 2 - 1,  # midpoint, 0-based
+               gc    = gc_pct)
+  })
+  bind_rows(result)
+}
+
+# ---- helper: resolve genome FASTA for a strain (strip _ont / _pb suffixes) ----
+find_genome_fasta <- function(strain) {
+  base <- sub("_(ont|pb)$", "", strain)
+  path <- file.path(genome_dir, paste0(base, ".masked.fasta"))
+  if (file.exists(path)) return(path)
+  NULL
+}
+
 # ===========================================================================
-# Main loop
+# Per-strain processing function (parallelised below)
 # ===========================================================================
-for (strain in strains) {
+process_strain <- function(strain) {
 
   message("\n=== ", strain, " ===")
 
@@ -65,7 +101,7 @@ for (strain in strains) {
   bed_file <- file.path(mosdepth_dir, paste0(strain, ".quantized.bed.gz"))
   if (!file.exists(bed_file)) {
     warning("Quantized BED file not found, skipping: ", bed_file)
-    next
+    return(invisible(NULL))
   }
 
   bed <- read_tsv(bed_file,
@@ -94,7 +130,7 @@ for (strain in strains) {
 
   if (length(scaffold_order) == 0) {
     warning("No scaffolds remain after length filter for ", strain)
-    next
+    return(invisible(NULL))
   }
 
   dat <- bed |>
@@ -113,20 +149,41 @@ for (strain in strains) {
   pages        <- chunk(scaffold_order, SCAFFOLDS_PER_PAGE)
   npages       <- length(pages)
 
+  # ---- load genome and compute GC% windows ----
+  gc_dat <- NULL
+  genome_fasta <- find_genome_fasta(strain)
+  if (!is.null(genome_fasta)) {
+    message("  computing GC% from ", basename(genome_fasta))
+    genome <- readDNAStringSet(genome_fasta)
+    names(genome) <- sub(" .*", "", names(genome))
+    gc_dat <- compute_gc_windows(genome, scaffold_order)
+    if (!is.null(gc_dat))
+      gc_dat$chrom <- factor(gc_dat$chrom, levels = scaffold_order)
+  } else {
+    message("  no genome FASTA found for ", strain, " — GC panel will be skipped")
+  }
+
   message("  ", nscaff, " scaffolds -> ", npages, " pages (", SCAFFOLDS_PER_PAGE, " per page)")
+
+  # ---- pre-split page data once to avoid repeated full-table scans ----
+  page_dat_list <- lapply(pages, function(scaffs)
+    dat |> filter(chrom %in% scaffs) |> mutate(chrom = factor(chrom, levels = scaffs)))
+
+  page_gc_list <- if (!is.null(gc_dat))
+    lapply(pages, function(scaffs)
+      gc_dat |> filter(chrom %in% scaffs) |> mutate(chrom = factor(chrom, levels = scaffs)))
+  else
+    vector("list", npages)
 
   # =========================================================================
   # 1. HEATMAP  (geom_rect tiles, one row per scaffold, colour = class)
   #    Multi-page PDF: 50 scaffolds per page
   # =========================================================================
   heat_path <- file.path(out_dir, "heatmap.pdf")
-  pdf(heat_path, width = 14, height = 20)
+  cairo_pdf(heat_path, width = 14, height = 20, onefile = TRUE)
 
   for (i in seq_along(pages)) {
-    scaffs    <- pages[[i]]
-    page_dat  <- dat |> filter(chrom %in% scaffs) |>
-                   mutate(chrom = factor(chrom, levels = scaffs))
-    n_this    <- length(scaffs)
+    page_dat <- page_dat_list[[i]]
 
     p_heat <- ggplot(page_dat, aes(xmin = start, xmax = end,
                                    ymin = 0,    ymax = 1,
@@ -142,7 +199,7 @@ for (strain in strains) {
                           " - scaffold coverage (quantized heatmap)",
                           "  [page ", i, " / ", npages, "]"),
         subtitle = "Colour = mosdepth quantized coverage class",
-        x        = "Genomic position (bp)",
+        x        = if (is.null(gc_dat)) "Genomic position (bp)" else NULL,
         y        = NULL
       ) +
       base_theme +
@@ -150,10 +207,37 @@ for (strain in strains) {
         strip.text.y.left = element_text(angle = 0, hjust = 1),
         axis.text.y       = element_blank(),
         axis.ticks.y      = element_blank(),
+        axis.text.x       = if (is.null(gc_dat)) element_text() else element_blank(),
+        axis.ticks.x      = if (is.null(gc_dat)) element_line() else element_blank(),
         panel.grid        = element_blank()
       )
 
-    print(p_heat)
+    page_gc <- page_gc_list[[i]]
+    if (!is.null(page_gc)) {
+      gc_median <- median(page_gc$gc, na.rm = TRUE)
+
+      p_gc <- ggplot(page_gc, aes(x = pos, y = gc)) +
+        geom_hline(yintercept = gc_median, colour = "grey60",
+                   linewidth = 0.3, linetype = "dashed") +
+        geom_line(colour = "#2ca25f", linewidth = 0.4) +
+        facet_wrap(~chrom, ncol = 1, scales = "free_x",
+                   strip.position = "left") +
+        scale_y_continuous(limits = c(0, 100),
+                           breaks = c(25, 50, 75),
+                           labels = function(x) paste0(x, "%")) +
+        labs(x = "Genomic position (bp)", y = "GC%") +
+        base_theme +
+        theme(
+          strip.text        = element_blank(),
+          strip.background  = element_blank(),
+          panel.grid.minor  = element_blank(),
+          panel.grid.major.x = element_blank()
+        )
+
+      print(p_heat / p_gc + plot_layout(heights = c(4, 1)))
+    } else {
+      print(p_heat)
+    }
   }
 
   dev.off()
@@ -171,7 +255,7 @@ for (strain in strains) {
     ungroup()
 
   bar_path <- file.path(out_dir, "bar.pdf")
-  pdf(bar_path, width = 12, height = 18)
+  cairo_pdf(bar_path, width = 12, height = 18, onefile = TRUE)
 
   for (i in seq_along(pages)) {
     scaffs       <- pages[[i]]
@@ -202,7 +286,19 @@ for (strain in strains) {
   message("  saved -> ", bar_path)
 
   message("  done: ", nscaff, " scaffolds plotted across ", npages, " pages")
+  invisible(NULL)
+}
+
+# ===========================================================================
+# Run: parallel over strains (falls back to sequential if only one core)
+# ===========================================================================
+ncores <- min(length(strains), max(1L, detectCores() - 1L))
+message("Processing ", length(strains), " strain(s) on ", ncores, " core(s)")
+
+if (ncores > 1) {
+  mclapply(strains, process_strain, mc.cores = ncores)
+} else {
+  lapply(strains, process_strain)
 }
 
 message("\nAll strains processed. Output in: ", out_base)
-
