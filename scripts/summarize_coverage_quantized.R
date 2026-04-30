@@ -17,7 +17,6 @@ library(readr)
 library(stringr)
 library(forcats)
 library(Biostrings)
-library(patchwork)
 library(parallel)
 
 # ---- paths ----
@@ -184,7 +183,9 @@ process_strain <- function(strain) {
 
   for (i in seq_along(pages)) {
     page_dat <- page_dat_list[[i]]
+    page_gc  <- page_gc_list[[i]]
 
+    # Base heatmap — GC overlay added below when available
     p_heat <- ggplot(page_dat, aes(xmin = start, xmax = end,
                                    ymin = 0,    ymax = 1,
                                    fill = label)) +
@@ -199,45 +200,46 @@ process_strain <- function(strain) {
                           " - scaffold coverage (quantized heatmap)",
                           "  [page ", i, " / ", npages, "]"),
         subtitle = "Colour = mosdepth quantized coverage class",
-        x        = if (is.null(gc_dat)) "Genomic position (bp)" else NULL,
+        x        = "Genomic position (bp)",
         y        = NULL
       ) +
       base_theme +
       theme(
-        strip.text.y.left = element_text(angle = 0, hjust = 1),
-        axis.text.y       = element_blank(),
-        axis.ticks.y      = element_blank(),
-        axis.text.x       = if (is.null(gc_dat)) element_text() else element_blank(),
-        axis.ticks.x      = if (is.null(gc_dat)) element_line() else element_blank(),
-        panel.grid        = element_blank()
+        strip.text.y.left  = element_text(angle = 0, hjust = 1),
+        axis.text.y.left   = element_blank(),
+        axis.ticks.y.left  = element_blank(),
+        panel.grid         = element_blank()
       )
 
-    page_gc <- page_gc_list[[i]]
     if (!is.null(page_gc)) {
+      gc_min    <- min(page_gc$gc, na.rm = TRUE)
+      gc_max    <- max(page_gc$gc, na.rm = TRUE)
       gc_median <- median(page_gc$gc, na.rm = TRUE)
+      gc_range  <- gc_max - gc_min
+      if (gc_range < 0.01) gc_range <- 1  # guard against flat GC (e.g. all-N scaffolds)
+      gc_breaks <- pretty(c(gc_min, gc_max), n = 4)
+      gc_breaks <- gc_breaks[gc_breaks >= gc_min & gc_breaks <= gc_max]
 
-      p_gc <- ggplot(page_gc, aes(x = pos, y = gc)) +
-        geom_hline(yintercept = gc_median, colour = "grey60",
-                   linewidth = 0.3, linetype = "dashed") +
-        geom_line(colour = "#2ca25f", linewidth = 0.4) +
-        facet_wrap(~chrom, ncol = 1, scales = "free_x",
-                   strip.position = "left") +
-        scale_y_continuous(limits = c(0, 100),
-                           breaks = c(25, 50, 75),
-                           labels = function(x) paste0(x, "%")) +
-        labs(x = "Genomic position (bp)", y = "GC%") +
-        base_theme +
-        theme(
-          strip.text        = element_blank(),
-          strip.background  = element_blank(),
-          panel.grid.minor  = element_blank(),
-          panel.grid.major.x = element_blank()
-        )
+      page_gc_scaled <- page_gc |>
+        mutate(gc_scaled = (gc - gc_min) / gc_range)
 
-      print(p_heat / p_gc + plot_layout(heights = c(4, 1)))
-    } else {
-      print(p_heat)
+      p_heat <- p_heat +
+        geom_hline(yintercept = (gc_median - gc_min) / gc_range,
+                   colour = "grey60", linewidth = 0.3, linetype = "dashed") +
+        geom_line(data        = page_gc_scaled,
+                  mapping     = aes(x = pos, y = gc_scaled),
+                  inherit.aes = FALSE,
+                  colour      = "#2ca25f", linewidth = 0.4) +
+        scale_y_continuous(
+          limits   = c(0, 1),
+          sec.axis = sec_axis(~ . * gc_range + gc_min, name = "GC%",
+                              breaks = (gc_breaks - gc_min) / gc_range,
+                              labels = paste0(round(gc_breaks, 1), "%"))
+        ) +
+        labs(subtitle = "Colour = mosdepth quantized coverage class; green line = GC%")
     }
+
+    print(p_heat)
   }
 
   dev.off()
