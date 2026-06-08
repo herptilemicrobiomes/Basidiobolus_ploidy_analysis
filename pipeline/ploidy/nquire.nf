@@ -34,6 +34,7 @@ params.min_mapq     = 20   // -q flag for all nQuire create calls
 process BAM_TO_SCAFFOLD_BED {
     tag { strain }
     label 'quick'
+    publishDir "${launchDir}/scaffold_bed", mode: 'copy', pattern: "*.bed"
 
     input:
     tuple val(strain), path(bam), path(bai)
@@ -99,7 +100,7 @@ process NQUIRE_WHOLE_GENOME {
 
 /*
  * Per-scaffold nQuire: create across all scaffolds → denoise each bin →
- * lrdmodel each bin → concatenate into one TSV.
+ * lrdmodel each bin to individual .model.out → combine into one TSV.
  */
 process NQUIRE_PER_SCAFFOLD {
     tag { strain }
@@ -117,45 +118,34 @@ process NQUIRE_PER_SCAFFOLD {
     mkdir -p perchrom perchrom_denoised
     module load nQuire
     nQuire create -b ${bam} -r ${scaffold_bed} \
-        -o perchrom -c ${params.min_cov_sc} -q ${params.min_mapq}
+        -o perchrom/${strain} -c ${params.min_cov_sc} -q ${params.min_mapq}
 
-    header_written=0
-    for bin in perchrom/*.bin; do
+    for bin in perchrom/${strain}-*.bin; do
         [ -f "\$bin" ] || continue
         pref=\$(basename "\$bin" .bin)
-        nQuire denoise -o perchrom_denoised "\$bin"
-        denoised="perchrom_denoised/\${pref}.denoised.bin"
-        [ -f "\$denoised" ] || continue
-
-        if [ \$header_written -eq 0 ]; then
-            nQuire lrdmodel -t ${task.cpus} "\$denoised" \
-                | awk -v s="${strain}" -v sc="\$pref" '
-                    NR==1 { sub(/^[^\\t]+/, "strain\\tscaffold"); print; next }
-                          { sub(/^[^\\t]+/, s "\\t" sc);          print }
-                ' >> ${strain}.perchrom.nquire.tsv
-            header_written=1
-        else
-            nQuire lrdmodel -t ${task.cpus} "\$denoised" \
-                | awk -v s="${strain}" -v sc="\$pref" '
-                    NR==1 { next }
-                          { sub(/^[^\\t]+/, s "\\t" sc); print }
-                ' >> ${strain}.perchrom.nquire.tsv
-        fi
+        nQuire denoise -o "perchrom_denoised/\${pref}" "\$bin"
+        nQuire lrdmodel -t ${task.cpus} "perchrom_denoised/\${pref}.bin" \
+            1> "perchrom_denoised/\${pref}.model.out" 2>/dev/null
     done
 
-    # ensure output exists even if no scaffolds passed coverage filter
+    head -n 1 \$(ls perchrom_denoised/*.model.out | head -n 1) \
+        | perl -p -e 's/file/scaffold/' > ${strain}.perchrom.nquire.tsv
+    grep -vh 'free' perchrom_denoised/*.model.out \
+        | perl -p -e 's/^\\S+-(\\S+)\\.bin/\$1/' \
+        | sort -t_ -k 2,2n >> ${strain}.perchrom.nquire.tsv
+
     touch ${strain}.perchrom.nquire.tsv
     """
 
     stub:
     """
-    printf 'strain\\tscaffold\\tdip\\trip\\ttet\\tbest\\n' > ${strain}.perchrom.nquire.tsv
+    printf 'scaffold\\tdip\\trip\\ttet\\tbest\\n' > ${strain}.perchrom.nquire.tsv
     """
 }
 
 /*
- * Per-gene nQuire: create across gene BED → denoise each bin →
- * lrdmodel each bin → concatenate into one TSV.
+ * Per-gene nQuire: create across gene BED → denoise each bin (with retry) →
+ * lrdmodel each bin to individual .model.out → combine into one TSV.
  * Skipped automatically when no gene BED is found for a strain.
  */
 process NQUIRE_PER_GENE {
@@ -174,38 +164,46 @@ process NQUIRE_PER_GENE {
     mkdir -p pergene pergene_denoised
     module load nQuire
     nQuire create -b ${bam} -r ${gene_bed} \
-        -o pergene -c ${params.min_cov_gene} -q ${params.min_mapq}
+        -o pergene/${strain} -c ${params.min_cov_gene} -q ${params.min_mapq}
 
-    header_written=0
-    for bin in pergene/*.bin; do
+    bin_count=\$(ls pergene/${strain}-*.bin 2>/dev/null | wc -l)
+    echo "[nQuire pergene] ${strain}: \${bin_count} gene bins" >&2
+
+    # Phase 1: denoise all bins with retry
+    for bin in pergene/${strain}-*.bin; do
         [ -f "\$bin" ] || continue
         pref=\$(basename "\$bin" .bin)
-        nQuire denoise -o pergene_denoised "\$bin"
-        denoised="pergene_denoised/\${pref}.denoised.bin"
-        [ -f "\$denoised" ] || continue
-
-        if [ \$header_written -eq 0 ]; then
-            nQuire lrdmodel -t ${task.cpus} "\$denoised" \
-                | awk -v s="${strain}" -v g="\$pref" '
-                    NR==1 { sub(/^[^\\t]+/, "strain\\tgene"); print; next }
-                          { sub(/^[^\\t]+/, s "\\t" g);       print }
-                ' >> ${strain}.pergene.nquire.tsv
-            header_written=1
-        else
-            nQuire lrdmodel -t ${task.cpus} "\$denoised" \
-                | awk -v s="${strain}" -v g="\$pref" '
-                    NR==1 { next }
-                          { sub(/^[^\\t]+/, s "\\t" g); print }
-                ' >> ${strain}.pergene.nquire.tsv
+        attempt=0
+        while [ \$attempt -lt 3 ]; do
+            nQuire denoise -o "pergene_denoised/\${pref}" "\$bin" && break
+            attempt=\$((attempt + 1))
+            echo "[nQuire pergene] retry \${attempt}/3: denoise failed for \${pref}" >&2
+        done
+        if [ \$attempt -eq 3 ]; then
+            echo "[nQuire pergene] WARN: denoise failed after 3 attempts for \${pref}, skipping" >&2
         fi
     done
+
+    # Phase 2: lrdmodel all denoised bins to individual .model.out files
+    for bin in pergene_denoised/*.bin; do
+        [ -f "\$bin" ] || continue
+        pref=\$(basename "\$bin" .bin)
+        nQuire lrdmodel -t ${task.cpus} "\$bin" \
+            1> "pergene_denoised/\${pref}.model.out" 2>/dev/null
+    done
+
+    head -n 1 \$(ls pergene_denoised/*.model.out | head -n 1) \
+        | perl -p -e 's/file/gene/' > ${strain}.pergene.nquire.tsv
+    grep -vh 'free' pergene_denoised/*.model.out \
+        | perl -p -e 's/^\\S+-(\\S+)\\.bin/\$1/' \
+        | sort -t_ -k 2,2n >> ${strain}.pergene.nquire.tsv
 
     touch ${strain}.pergene.nquire.tsv
     """
 
     stub:
     """
-    printf 'strain\\tgene\\tdip\\trip\\ttet\\tbest\\n' > ${strain}.pergene.nquire.tsv
+    printf 'gene\\tdip\\trip\\ttet\\tbest\\n' > ${strain}.pergene.nquire.tsv
     """
 }
 
