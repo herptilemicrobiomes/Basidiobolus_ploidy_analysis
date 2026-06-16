@@ -119,21 +119,27 @@ default 50), `--strain NAME` (repeatable; default = all strains found).
   (`*_ont`, `NRRL2992_pb`, `STP1710.7`) are 0-row and are skipped. `NRRL2992`
   has no `.fai`, so its contig sizes come from the BED, and it has very few
   estimable genes (1,540 / 19,174).
-- **Ploidy call summary** (estimable genes; winner = smallest delta-LL):
+- **Ploidy call summary** (estimable genes; winner = smallest delta-LL;
+  percentages are of *called* genes). Source: `results/nquire2/plots/ploidy_call_summary.tsv`.
 
-  | strain | called | missing | 2n | 3n | 4n | dominant |
-  |---|---|---|---|---|---|---|
-  | CBS931.73_pb | 12,270 | 4,256 | 230 | 1,000 | 11,040 | strongly 4n (90%) |
-  | Bran_AGB5 | 11,991 | 6,644 | 2,482 | 1,704 | 7,805 | 4n |
-  | CBS931.73 | 9,161 | 7,365 | 2,268 | 2,054 | 4,839 | 4n / mixed |
-  | STP1717.1 | 3,384 | 13,264 | 985 | 615 | 1,784 | 4n / mixed |
-  | NRRL2992 | 1,540 | 17,634 | 516 | 279 | 745 | mixed (sparse) |
-  | UHM260.5136 | 7,055 | 10,064 | 3,167 | 1,149 | 2,739 | 2n / mixed |
-  | UHM207.4505 | 6,176 | 13,247 | 3,113 | 783 | 2,280 | 2n |
-  | UHM516.7697 | 6,026 | 13,213 | 3,181 | 717 | 2,128 | 2n |
-  | UHM520.7734 | 7,969 | 10,635 | 4,752 | 785 | 2,432 | 2n |
+  | strain | total | called | missing | 2n | 3n | 4n | dominant |
+  |---|---|---|---|---|---|---|---|
+  | CBS931.73_pb | 16,526 | 12,270 | 4,256 | 232 (2%) | 997 (8%) | 11,041 (90%) | strongly 4n |
+  | Bran_AGB5 | 18,635 | 11,988 | 6,647 | 2,483 (21%) | 1,699 (14%) | 7,806 (65%) | 4n |
+  | CBS931.73 | 16,526 | 9,161 | 7,365 | 2,265 (25%) | 2,069 (23%) | 4,827 (53%) | 4n / mixed |
+  | STP1717.1 | 16,648 | 3,385 | 13,263 | 986 (29%) | 616 (18%) | 1,783 (53%) | 4n / mixed |
+  | NRRL2992 | 19,174 | 1,540 | 17,634 | 516 (34%) | 279 (18%) | 745 (48%) | mixed (sparse) |
+  | UHM260.5136 | 17,119 | 7,056 | 10,063 | 3,160 (45%) | 1,155 (16%) | 2,741 (39%) | 2n / mixed |
+  | UHM207.4505 | 19,423 | 6,176 | 13,247 | 3,113 (50%) | 782 (13%) | 2,281 (37%) | 2n |
+  | UHM516.7697 | 19,239 | 6,026 | 13,213 | 3,183 (53%) | 716 (12%) | 2,127 (35%) | 2n |
+  | UHM520.7734 | 18,604 | 7,970 | 10,634 | 4,750 (60%) | 789 (10%) | 2,431 (31%) | 2n |
+  | STP1710.7 | 27,000 | 7,345 | 19,655 | 4,618 (63%) | 327 (4%) | 2,400 (33%) | 2n |
 
-  The UHM strains skew diploid; the CBS/Bran strains skew tetraploid. The same
-  CBS931.73 isolate looks more strongly tetraploid in its PacBio assembly
-  (`_pb`) than in the short-read assembly, which is worth keeping in mind when
-  comparing calls across assembly types.
+  The UHM strains and STP1710.7 skew diploid; the CBS/Bran strains skew
+  tetraploid. The same CBS931.73 isolate looks more strongly tetraploid in its
+  PacBio assembly (`_pb`, 90% 4n) than in the short-read assembly (53% 4n),
+  which is worth keeping in mind when comparing calls across assembly types.
+  Note also that "called" is often a minority of "total" genes — many genes are
+  unestimable (all three deltas missing) and are excluded from the percentages,
+  so strains with low `called` counts (e.g. NRRL2992, STP1717.1) carry the most
+  uncertainty.

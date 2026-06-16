@@ -21,11 +21,14 @@ ALN=aln
 GENEDIR=bed
 SCAFFOLDBED=scaffold_bed
 RESULT=results/nquire2
-SCRATCH_BASE=${SCRATCH:-/tmp}
+#SCRATCH_BASE=${SCRATCH:-/tmp}
+SCRATCH_BASE=nquire_scratch
+#${SCRATCH:-/tmp}
+mkdir -p $SCRATCH_BASE
 mkdir -p "$RESULT" $SCAFFOLDBED
 
 # ---- Select BAM by array index --------------------------------------------
-mapfile -t BAMFILES < <(ls "$ALN"/*.bam 2>/dev/null | sort)
+mapfile -t BAMFILES < <(find "$ALN" -name "*.bam" 2>/dev/null | sort)
 if [ ${#BAMFILES[@]} -eq 0 ]; then
     echo "ERROR: no BAM files found in $ALN/"
     exit 1
@@ -37,11 +40,12 @@ if [ -z "$BAM" ] || [ ! -f "$BAM" ]; then
     exit 1
 fi
 
-STRAIN=$(basename "$BAM" .bam)
-WORKDIR="$SCRATCH_BASE/nquire_${STRAIN}"
+STRAIN=$(basename "$BAM" .bam | perl -p -e 's/_(pb|ont)//')
+BASE=$(basename "$BAM" .bam)
+WORKDIR="$SCRATCH_BASE/nquire_${BASE}"
 mkdir -p "$WORKDIR"
 
-echo "N=$N  BAM=$BAM  STRAIN=$STRAIN"
+echo "N=$N  BAM=$BAM  STRAIN=$STRAIN BASE=$BASE"
 
 # ---- Build per-scaffold BED from BAM header -------------------------------
 # Format required by nQuire: Chr Start End Name
@@ -66,14 +70,13 @@ fi
 # Whole-genome analysis
 # ==========================================================================
 echo "--- Whole genome ---"
-WG_PREFIX="$WORKDIR/${STRAIN}.wg"
-WG_TSV="$RESULT/${STRAIN}.nquire.tsv"
+WG_PREFIX="$WORKDIR/${BASE}.wg"
+WG_TSV="$RESULT/${BASE}.nquire.tsv"
 if [ ! -s $WG_TSV ]; then
     nQuire create -b "$BAM" -o "$WG_PREFIX" -c 5 -q 20
     nQuire denoise -o "${WG_PREFIX}.denoised" "${WG_PREFIX}.bin"
     
     # lrdmodel outputs: header line then one data line per input file
-    WG_TSV="$RESULT/${STRAIN}.nquire.tsv"
     {
 	# header: replace leading "name" column with "strain"
 	nQuire lrdmodel -t "$CPU" "${WG_PREFIX}.denoised.bin" | awk -v s="$STRAIN" '
@@ -88,7 +91,7 @@ fi
 # Per-scaffold analysis
 # ==========================================================================
 echo "--- Per scaffold ---"
-PERCHROM_TSV="$RESULT/${STRAIN}.perchrom.nquire.tsv"
+PERCHROM_TSV="$RESULT/${BASE}.perchrom.nquire.tsv"
 HEADER_WRITTEN=0
 
 mkdir -p "$WORKDIR/perchrom" 
@@ -98,15 +101,15 @@ mkdir -p "$WORKDIR/perchrom.denoised"
 if [ ! -s $PERCHROM_TSV ]; then
     echo "RUNNING nQuire create -b \"$BAM\" -r \"$BED\" -o \"$WORKDIR/perchrom/${STRAIN}\" -c 4 -q 20"
     nQuire create -b "$BAM" -r "$BED" -o "$WORKDIR/perchrom/${STRAIN}" -c 4 -q 20
-    for file in $(ls "${WORKDIR}/perchrom/${STRAIN}-"*.bin)
+    for file in $(find "${WORKDIR}/perchrom/" -name "${STRAIN}-*.bin")
     do
 	PREF=$(basename $file .bin)
     # -o takes a prefix; nQuire appends .bin → pass PREF.denoised to get PREF.denoised.bin
 	nQuire denoise -o "$WORKDIR/perchrom.denoised/${PREF}" $file
 	nQuire lrdmodel -t "$CPU" "$WORKDIR/perchrom.denoised/${PREF}.bin" 1> $WORKDIR/perchrom.denoised/${PREF}.model.out 2> /dev/null
     done
-    head -n 1 $(ls $WORKDIR/perchrom.denoised/*.model.out | head -n 1) | perl -p -e 's/file/scaffold/' > $PERCHROM_TSV
-    grep -vh 'free' $WORKDIR/perchrom.denoised/*.model.out | perl -p -e 's/^\S+\-(\S+)\.bin/$1/' | sort -t_ -k 2,2n >> $PERCHROM_TSV
+    head -n 1 $(find "${WORKDIR}/perchrom.denoised/" -name "*.model.out" | head -n 1) | perl -p -e 's/file/scaffold/' > $PERCHROM_TSV
+    find "$WORKDIR/perchrom.denoised" -name "*.model.out" | xargs -r grep -vh 'free' | perl -p -e 's/^\S+\-(\S+)\.bin/$1/' | sort -t_ -k 2,2n >> $PERCHROM_TSV
 fi
 
 echo "Per-scaffold result -> $PERCHROM_TSV"
@@ -115,18 +118,18 @@ echo "Per-scaffold result -> $PERCHROM_TSV"
 # ====
 #
 # echo "--- Per gene ---"
-PERGENE_TSV="$RESULT/${STRAIN}.pergene.nquire.tsv"
+PERGENE_TSV="$RESULT/${BASE}.pergene.nquire.tsv"
 HEADER_WRITTEN=0
 GENE=$GENEDIR/${STRAIN}.bed
 mkdir -p "${WORKDIR}/pergene" "${WORKDIR}/pergene.denoised"
 if [ ! -s $PERGENE_TSV ]; then
-    nQuire create -b "$BAM" -o "$WORKDIR/pergene/" -r $GENE -c 4 -q 20
+    nQuire create -b "$BAM" -o "$WORKDIR/pergene/${STRAIN}" -r $GENE -c 4 -q 20
 
-    bin_count=$(ls "${WORKDIR}/pergene"/*.bin 2>/dev/null | wc -l)
+    bin_count=$(find "${WORKDIR}/pergene/" -name "${STRAIN}-*.bin" 2>/dev/null | wc -l)
     echo "[nQuire pergene] $STRAIN: $bin_count gene bins" >&2
 
     # Phase 1: denoise all bins with retry
-    for file in "${WORKDIR}/pergene"/*.bin; do
+    for file in $(find "${WORKDIR}/pergene/" -name "*.bin"); do
 	[ -f "$file" ] || continue
 	PREF=$(basename "$file" .bin)
 	attempt=0
@@ -141,13 +144,13 @@ if [ ! -s $PERGENE_TSV ]; then
 
     # Phase 2: lrdmodel all denoised bins, header printed once
     HEADER_WRITTEN=0
-    for denoised in "${WORKDIR}/pergene.denoised"/*.bin; do
+    for denoised in $(find "${WORKDIR}/pergene.denoised/" -name "*.bin"); do
 	[ -f "$denoised" ] || continue
 	PREF=$(basename "$denoised" .bin)
 	nQuire lrdmodel -t "$CPU" "$WORKDIR/pergene.denoised/${PREF}.bin" 1> $WORKDIR/pergene.denoised/${PREF}.model.out 2> /dev/null
     done
-    head -n 1 $(ls $WORKDIR/pergene.denoised/*.model.out | head -n 1) | perl -p -e 's/file/gene/' > $PERGENE_TSV
-    grep -vh 'free' $WORKDIR/pergene.denoised/*.model.out | perl -p -e 's/^\S+\-(\S+)\.bin/$1/' | sort -t_ -k 2,2n >> $PERGENE_TSV
+    head -n 1 $(find "${WORKDIR}/pergene.denoised/" -name "*.model.out" | head -n 1) | perl -p -e 's/file/gene/' > $PERGENE_TSV
+    find "$WORKDIR/pergene.denoised/" -name "*.model.out" | xargs -r grep -vh 'free' | perl -p -e 's/^\S+\-(\S+)\.bin/$1/' | sort -t_ -k 2,2n >> $PERGENE_TSV
 fi
 
 
@@ -155,4 +158,4 @@ echo "Per-gene result -> $PERGENE_TSV"
 
 # ---- Cleanup scratch ------------------------------------------------------
 #rm -rf "$WORKDIR"
-echo "Done: $STRAIN"
+echo "Done: strain=$STRAIN base=$BASE to $PERGENE_TSV"
