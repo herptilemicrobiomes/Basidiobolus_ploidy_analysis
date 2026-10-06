@@ -143,3 +143,110 @@ default 50), `--strain NAME` (repeatable; default = all strains found).
   unestimable (all three deltas missing) and are excluded from the percentages,
   so strains with low `called` counts (e.g. NRRL2992, STP1717.1) carry the most
   uncertainty.
+
+---
+
+## Short- vs long-read concordance of nQuire calls
+
+`scripts/nquire_platform_concordance.py` summarises the per-gene and
+whole-genome nQuire tables in `results/nquire2/` and compares calls between
+short-read and long-read (`_ont`, `_pb`) alignments of the same strain.
+Requires Python 3 with pandas and numpy (matplotlib optional, for the PDF).
+
+```
+python scripts/nquire_platform_concordance.py                 # defaults
+python scripts/nquire_platform_concordance.py --min-margin 5  # ΔLL needed for a "confident" call
+```
+
+Calls use the same rule as `plot_pergene_ploidy.R` (smallest ΔLL wins; 0/nan
+are missing). Two extra diagnostics are reported per gene: `margin` (second-best
+minus best ΔLL, i.e. how decisive the call is) and `relfit` (best ΔLL / free
+log-likelihood; near 0 means a fixed ploidy model fits about as well as the
+free mixture, near 1 means none fits).
+
+Outputs in `results/nquire2/concordance/`:
+
+| File | Contents |
+| --- | --- |
+| `pergene_call_summary.tsv` | per-sample call fractions, all and confident calls, margin and fit diagnostics |
+| `wholegenome_summary.tsv` | whole-genome call, margin and relative fit per sample |
+| `platform_concordance.tsv` | per-strain agreement and Cohen's κ on genes called by both platforms |
+| `crosstab_<strain>.tsv` | short-read (rows) × long-read (cols) per-gene call table |
+| `platform_shift.pdf` | call composition, short vs long reads, per strain |
+
+### Findings
+
+- `_pb` and `_ont` samples are PacBio/ONT **reads** mapped to the reference
+  (see `samples.csv`), not separate assemblies.
+- Long-read runs call more genes 4n than the short-read run of the same strain
+  in every pair (e.g. CBS931.73 53% → 90%; UHM207.4505 37% → 66%), and every ONT
+  whole-genome run is called 4n, including the UHM strains whose short-read
+  whole-genome runs are called 2n. Read error inflating allele-frequency mass
+  near 0.25/0.75 is a likely cause, so allele-frequency ploidy inference should
+  rely on short reads (or HiFi) unless long-read SNPs are strictly filtered.
+- Per-gene calls agree poorly between platforms (Cohen's κ 0.06–0.21; 0.03–0.29
+  restricted to confident calls), so individual gene-level calls should not be
+  interpreted as gene-level ploidy.
+- Short-read whole-genome calls: CBS931.73 4n with a good relative fit; UHM207,
+  UHM516, UHM520 2n; Bran_AGB5 and UHM260 called but with poor fit to all fixed
+  models (relfit > 0.85); STP1710.7 and STP1717.1 short-read whole-genome runs
+  produced no estimate and should be rerun.
+
+## Read depth and spatial clustering of per-gene calls
+
+`scripts/nquire_depth_spatial.py` joins per-gene nQuire calls with per-gene
+mosdepth depth (`results/mosdepth/<sample>.regions.bed.gz`) and tests whether
+same-call genes cluster along scaffolds (within-scaffold permutation of calls).
+Depth is normalised to the sample's median gene depth.
+
+```
+uv run scripts/nquire_depth_spatial.py            # or python with pandas/numpy/matplotlib
+uv run scripts/nquire_depth_spatial.py --min-margin 5 --nperm 1000
+```
+
+Outputs in `results/nquire2/depth_spatial/`: `depth_by_call.tsv`,
+`spatial_clustering.tsv`, `pergene_depth_calls.tsv.gz`, `depth_by_call.pdf`.
+
+### Findings
+
+- In the UHM, STP1710.7 and STP1717.1 short-read runs, genes at single-copy
+  depth (0.75–1.25×) are called 4n only 16–42% of the time. Genes below
+  0.75× depth are called 4n 47–96% of the time, and genes above 2× depth
+  52–82%. So most per-gene 25:75 calls come from depth outliers or noise,
+  not from a genome-wide 4n state.
+- Each strain has a group of about 2,000–3,300 genes at about **half depth in
+  both short and long reads**, and these genes are called 4n on both
+  platforms (62–80% of short-read calls). In CBS931.73, STP1710.7 and UHM516
+  about 60% of them sit on scaffolds whose whole-scaffold median depth is
+  under 0.8×. That points to an assembly that keeps both haplotypes (or
+  diverged paralogs) as separate contigs, with reads split between them and
+  some cross-mapping. Check with Merqury spectra-cn, purge_dups or BUSCO
+  duplication before reading these genes as polyploid.
+- CBS931.73 is the exception. Its 4n fraction stays at about 0.5–0.7 at
+  every depth, which fits a genome-wide signal (a real 4n genome or a mixed
+  culture) rather than depth artefacts.
+- Spatial clustering of short-read calls is weak (same-call adjacency
+  0.50–0.75 against 0.48–0.74 under permutation; the longest 4n run is
+  ≤10 genes except in CBS931.73, where it is 20). This gives no evidence for
+  large aneuploid or duplicated segments.
+
+## k-mer ploidy (GenomeScope2 + Smudgeplot)
+
+`pipeline/ploidy/kmer_ploidy.sh` is a SLURM array over the 8 short-read rows
+of `samples.csv`. It counts k-mers with FastK, fits GenomeScope2 at p = 2, 3
+and 4, and runs Smudgeplot. It doesn't use the reference, so it checks the
+nQuire calls independently of assembly and mapping problems.
+
+```bash
+mkdir -p logs
+sbatch pipeline/ploidy/kmer_ploidy.sh          # all 8 short-read samples
+K=31 sbatch pipeline/ploidy/kmer_ploidy.sh     # different k
+```
+
+Outputs go to `results/kmer_ploidy/<strain>/`: `<strain>.k21.hist`,
+`genomescope_p{2,3,4}/`, `genomescope_summary.tsv` and `<strain>_smudgeplot*.pdf`.
+Check the module names (`fastk`, `genomescope`, `smudgeplot`) against
+`module avail` before submitting.
+
+See `analysis/ploidy_findings_summary.md` for the current interpretation
+and next steps.
